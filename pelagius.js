@@ -15,21 +15,30 @@ const https = require('https');
 
 const token = config.bot.token;
 const logChannel = config.bot.log_channel;
-const fileTypes = ['loadorder', 'skips', 'reasons', 'loot'];
 const prefix = config.bot.prefix;
+
+let types = new Map();
+types.set('loadorder', 'loadorder.txt');
+types.set('reasons', 'reasons.json');
+types.set('skips', 'skips.txt');
 
 var staffUsers = new Map();
 var approvedChannels = new Map();
 var settings = new Map();
 
 class Settings {
-    constructor(enabled, path) {
+    constructor(enabled, path, types) {
         this._enabled = (enabled === 'true');
         this._path = path;
+        this._fileTypes = types;
     }
 
     toString() {
-        return this._enabled + '\n' + this._path;
+        let types = '';
+        this._fileTypes.forEach((value, key) => {
+            types += key + ',' + value;
+        });
+        return this._enabled + '\n' + this._path + '\n' + types;
     }
 
     get enabled() {
@@ -47,30 +56,30 @@ class Settings {
     set path(str) {
         this._path = str;
     }
+
+    get fileTypes() {
+        return this._fileTypes;
+    }
+
+    set fileTypes(types) {
+        this._fileTypes = types;
+    }
 }
 
-function getFileNameFromFileType(fileType) {
-    if (fileType === 'loadorder') {
-        return 'loadorder.txt';
-    } else if (fileType === 'skips') {
-        return 'skips.txt';
-    } else if (fileType === 'loot') {
-        return 'userlist.yaml';
-    } else if (fileType === 'reasons') {
-        return 'reasons.json';
-    }
-    return null;
+function getFileNameFromFileType(guild, fileType) {
+    let guildSettings = settings.get(guild.id);
+    let guildTypes = guildSettings.fileTypes;
+
+    return types.get(fileType) !== undefined ? types.get(fileType) : guildTypes.get(fileType);
 }
 
-function getExtensionFromFileType(fileType) {
-    if (fileType === 'loadorder' || fileType === 'skips') {
-        return '.txt';
-    } else if (fileType === 'loot') {
-        return '.yaml';
-    } else if (fileType === 'reasons') {
-        return '.json';
+function getExtensionFromFileType(guild, fileType) {
+    let fileName = getFileNameFromFileType(guild, fileType);
+    if (fileName === undefined) {
+        return null;
     }
-    return null;
+    let index = fileName.indexOf('.');
+    return fileName.substring(index, fileName.length);
 }
 
 function getChannel(id) {
@@ -178,10 +187,17 @@ async function loadStaff(guild) {
 async function loadSettings(guild) {
     return fs.promises.readFile('./data/' + guild.id + '/settings.dat', 'utf8').then((data) => {
         let lines = data.toString().split(/\r?\n/);
-        settings.set(guild.id, new Settings(lines[0], lines[1]));
+        let files = new Map();
+        if (lines.length > 2) {
+            for (let i = 2; i < lines.length; i+=1) {
+                let types = lines[i].split(',');
+                files.set(types[0], types[1]);
+            }
+        }
+        settings.set(guild.id, new Settings(lines[0], lines[1], files));
         logMessage('Loaded settings for ' + getGuildStr(guild) + ' to memory');
     }).catch(() => {
-        settings.set(guild.id, new Settings('true', 'MO2/profiles/[profile]/loadorder.txt'));
+        settings.set(guild.id, new Settings('true', 'MO2/profiles/[profile]/loadorder.txt', new Map()));
         saveSettings(guild).then(() => {
             logMessage('Created new settings for ' + getGuildStr(guild));
         }).catch((err) => {
@@ -225,28 +241,28 @@ function isStaff(guild, userID) {
     return guildStaff.includes(userID);
 }
 
-function isValidFile(fileType) {
-    return fileTypes.includes(fileType);
+function isValidFile(guild, fileType) {
+    return getFileNameFromFileType(guild, fileType) !== undefined;
 }
 
 async function archiveFile(guild, fileType) {
     let folder = './data/' + guild.id + '/archive/' + fileType;
-    let filePath = './data/' + guild.id + '/' + getFileNameFromFileType(fileType);
+    let filePath = './data/' + guild.id + '/' + getFileNameFromFileType(guild, fileType);
 
     await createDirectory(folder);
     let stats = await fs.promises.stat(filePath);
     let time = stats.mtime.toDateString().replace(/ /g, '_');
-    return fs.promises.rename(filePath, folder + '/' + fileType + '_' + time + getExtensionFromFileType(fileType));
+    return fs.promises.rename(filePath, folder + '/' + fileType + '_' + time + getExtensionFromFileType(guild, fileType));
 }
 
 async function archiveIfNeeded(guild, fileType) {
-    let filePath = './data/' + guild.id + '/' + getFileNameFromFileType(fileType);
+    let filePath = './data/' + guild.id + '/' + getFileNameFromFileType(guild, fileType);
     return fs.promises.access(filePath, fs.constants.F_OK).then(() => archiveFile(guild, fileType)).catch(() => { });
 }
 
 async function updateFile(guild, fileType, url) {
     await archiveIfNeeded(guild, fileType);
-    let file = fs.createWriteStream('./data/' + guild.id + '/' + getFileNameFromFileType(fileType));
+    let file = fs.createWriteStream('./data/' + guild.id + '/' + getFileNameFromFileType(guild, fileType));
     return new Promise((resolve, reject) => {
         https.get(url, (response) => {
             response.on('error', (err) => {
@@ -647,19 +663,38 @@ client.on('message', async (message) => {
             return;
         }
 
-        if (args.length === 1) {
+        let guildTypes = settings.get(message.guild.id)._fileTypes;
+        let fileTypes = '';
+        types.forEach((value, key) => {
+            fileTypes += key + ', ';
+        });
+
+        guildTypes.forEach((value, key) => {
+            if (key === '') {
+                return;
+            }
+            fileTypes += key + ', ';
+        });
+
+        fileTypes = fileTypes.substring(0, fileTypes.length - 2);
+
+        if (args.length === 1 || (args[1] !== 'update' && args[1] !== 'archive' && args[1] !== 'retrieve')) {
             message.channel.send('Subcommands of `' + prefix + 'loadorder file`:\n' +
                 '`' + prefix + 'loadorder file update [file]` - Updates the specified file\n' +
                 '`' + prefix + 'loadorder file archive [file]` - Archives the current specified file (rarely used)\n' +
                 '`' + prefix + 'loadorder file retrieve [file]` - Retrieves and sends the specified file in a discord message attachment\n\n' +
                 'Possible files:\n' +
-                fileTypes.toString());
+                fileTypes);
             return;
         }
 
-        if (!isValidFile(args[2])) {
-            message.channel.send('Unknown file type: `' + args[2] + '`. Known files types:\n' +
-                'loadorder\nskips\nreasons\nloot');
+        if (args.length === 2) {
+            message.channel.send('You must provide a file type. Known files types:\n' + fileTypes);
+            return;
+        }
+
+        if (!isValidFile(message.guild, args[2])) {
+            message.channel.send('Unknown file type: `' + args[2] + '`. Known files types:\n' + fileTypes);
             return;
         }
 
@@ -705,13 +740,13 @@ client.on('message', async (message) => {
                 logMessage('The ' + args[2] + ' file has been archived in ' + getGuildStr(message.guild));
             });
         } else if (args[1] === 'retrieve') {
-            fs.readFile('./data/' + message.guild.id + '/' + getFileNameFromFileType(args[2]), (err, data) => {
+            fs.readFile('./data/' + message.guild.id + '/' + getFileNameFromFileType(message.guild, args[2]), (err, data) => {
                 if (err) {
                     message.channel.send('Error: couldn\'t read the ' + args[2] + ' file, contact Robotic');
                     logMessage('Error: Failed to read ' + args[2] + ' file in ' + getGuildStr(message.guild) + '\n' + err);
                     console.log(err);
                 } else {
-                    let attachment = new Discord.MessageAttachment(data, getFileNameFromFileType(args[2]));
+                    let attachment = new Discord.MessageAttachment(data, getFileNameFromFileType(message.guild, args[2]));
                     message.channel.send('Here is the current ' + args[2] + ' file', attachment);
                 }
             });
